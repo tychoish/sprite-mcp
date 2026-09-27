@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: silex/emacs:${{ matrix.emacs-version }}-ci
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        emacs-version:
+          - "29.4"
+          - "30.2"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Lint Source Code
+        uses: tychoish/elisp-ci/lint@v0.1.0
+        with:
+          dependencies: "sprite mcpkit"
+
+      - name: Run Tests
+        uses: tychoish/elisp-ci@v0.1.0
+        with:
+          runner: elpaish
+          dependencies: "sprite mcpkit"
+          test-files: "test/test-sprite-mcp.el"

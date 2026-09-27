@@ -1,0 +1,116 @@
+#+TITLE: sprite-mcp.el -- spawn sprite daemons hosting mcpkit MCP services
+#+OPTIONS: toc:2 num:nil
+
+[[https://github.com/tychoish/sprite-mcp/actions][https://github.com/tychoish/sprite-mcp/actions/workflows/ci.yml/badge.svg]]
+
+* Overview
+:PROPERTIES:
+:CUSTOM_ID: overview
+:END:
+
+=sprite-mcp= spawns isolated [[https://github.com/tychoish/sprite][sprite]] sub-daemons, each rooted in its own linked git worktree under =<repo-root>/.wt/<id>= so that concurrent sprites never share (and stomp on) a working tree. Inside each daemon it loads [[https://github.com/tychoish/mcpkit.el][mcpkit]], starts an MCP service on a freshly allocated local port, and registers =mcpkit-editing='s core editing/diagnostics tools (=mcp_buffer_read=, =mcp_buffer_replace_region=, =mcp_ast_grep=, =mcp_project_diagnostics=) on that service. It then registers a reverse-proxy route for the sprite's opaque id with =mcpkit-proxy=, so the proxy gateway can forward MCP traffic to that sprite without callers needing to track individual ports. =sprite-mcp-kill= tears all of this back down, and an idle reaper periodically kills sprites whose last contact (tracked by sprite.el itself) has gone stale.
+
+* Contents                                                       :TOC:
+:PROPERTIES:
+:CUSTOM_ID: contents
+:END:
+- [[#overview][Overview]]
+- [[#installation][Installation]]
+  - [[#use-package-with-vc][use-package with VC]]
+  - [[#manual-installation][Manual Installation]]
+- [[#usage][Usage]]
+- [[#api-reference][API Reference]]
+- [[#related-packages][Related Packages]]
+- [[#license][License]]
+
+* Installation
+:PROPERTIES:
+:CUSTOM_ID: installation
+:END:
+
+=sprite-mcp= is not yet published on MELPA or ELPAish; install it directly from its Git repository. Its dependency =sprite= is distributed via ELPAish -- see [[https://github.com/tychoish/sprite#elpaish-recommended][sprite's installation instructions]] for archive and keyring setup before installing =sprite-mcp=. =mcpkit=, =mcpkit-editing=, and =mcpkit-proxy= are only ever loaded inside the spawned sprite daemons themselves (and, for =mcpkit-proxy=, on the parent side to register/unregister routes); see [[https://github.com/tychoish/mcpkit.el#elpaish-recommended][mcpkit.el's installation instructions]] for making them available on the sprites' =load-path=.
+
+** use-package with VC
+:PROPERTIES:
+:CUSTOM_ID: use-package-with-vc
+:END:
+Requires Emacs 29.1+. Installs on first load if not already present:
+
+#+BEGIN_SRC emacs-lisp
+(use-package sprite-mcp
+  :vc (:url "https://github.com/tychoish/sprite-mcp")
+  :after sprite)
+#+END_SRC
+
+** Manual Installation
+:PROPERTIES:
+:CUSTOM_ID: manual-installation
+:END:
+#+BEGIN_SRC sh
+git clone https://github.com/tychoish/sprite-mcp ~/.emacs.d/site-lisp/sprite-mcp
+#+END_SRC
+
+#+BEGIN_SRC emacs-lisp
+(add-to-list 'load-path "~/.emacs.d/site-lisp/sprite-mcp")
+(require 'sprite-mcp)
+#+END_SRC
+
+With Emacs 29.1+, you can also use ~package-vc-install~:
+
+#+BEGIN_SRC emacs-lisp
+(package-vc-install '(sprite-mcp
+                      :url "https://github.com/tychoish/sprite-mcp"))
+#+END_SRC
+
+* Usage
+:PROPERTIES:
+:CUSTOM_ID: usage
+:END:
+
+Spawn a sprite daemon hosting an MCP service rooted in a fresh worktree of the current repository:
+
+#+BEGIN_SRC emacs-lisp
+(sprite-mcp-start-idle-reaper) ;; once, to reap sprites idle past `sprite-mcp-idle-timeout'
+
+(defvar my/demo-sprite
+  (sprite-mcp-spawn :name "demo" :repo-root (project-root (project-current))))
+#+END_SRC
+
+This creates a linked git worktree, spawns the sprite daemon, starts an mcpkit MCP service inside it on an allocated port, registers =mcpkit-editing='s tools on that service, and registers a =mcpkit-proxy= route for the sprite's id, so MCP clients can reach it through the proxy gateway without knowing its port directly.
+
+Tear it down explicitly when done, or let the idle reaper reap it once it goes quiet past =sprite-mcp-idle-timeout= (30 minutes by default):
+
+#+BEGIN_SRC emacs-lisp
+(sprite-mcp-kill my/demo-sprite)
+#+END_SRC
+
+* API Reference
+:PROPERTIES:
+:CUSTOM_ID: api-reference
+:END:
+
+| Symbol / Command                                                       | Kind     | Description                                                              |
+|--------------------------------------------------------------------------+----------+---------------------------------------------------------------------------|
+| [[#sprite-mcp-spawn][~sprite-mcp-spawn~]]                               | Function | Spawns a worktree-rooted sprite daemon hosting an mcpkit MCP service.    |
+| [[#sprite-mcp-kill][~sprite-mcp-kill~]]                                 | Function | Tears down a sprite spawned by ~sprite-mcp-spawn~, worktree included.    |
+| [[#sprite-mcp-reap-idle][~sprite-mcp-reap-idle~]]                       | Function | Kills every registered sprite idle past ~sprite-mcp-idle-timeout~.       |
+| [[#sprite-mcp-start-idle-reaper][~sprite-mcp-start-idle-reaper~]]       | Function | Starts a repeating timer that runs ~sprite-mcp-reap-idle~.               |
+| [[#sprite-mcp-stop-idle-reaper][~sprite-mcp-stop-idle-reaper~]]         | Function | Cancels the idle-reaper timer, if running.                               |
+| [[#sprite-mcp-idle-timeout][~sprite-mcp-idle-timeout~]]                 | Option   | Seconds since last contact after which an idle sprite is reaped.         |
+| [[#sprite-mcp-reap-interval][~sprite-mcp-reap-interval~]]               | Option   | Seconds between idle-reaper sweeps.                                      |
+
+* Related Packages
+:PROPERTIES:
+:CUSTOM_ID: related-packages
+:END:
+
+- [[https://github.com/tychoish/sprite][sprite]]: The daemon-pool framework this package spawns and tears down sub-daemons through.
+- [[https://github.com/tychoish/mcpkit.el][mcpkit.el]]: The MCP service/tool registration framework loaded inside each spawned sprite.
+- [[https://github.com/tychoish/gptel-mcp][gptel-mcp]]: A sibling package bridging mcpkit service/tool registrations into gptel's tool-calling framework.
+
+* License
+:PROPERTIES:
+:CUSTOM_ID: license
+:END:
+
+GPL-3.0-or-later. See the [[file:LICENSE][LICENSE]] file for the full license text.
