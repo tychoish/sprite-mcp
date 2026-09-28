@@ -36,6 +36,7 @@
 (defvar server-auth-dir)
 
 (require 'sprite)
+(require 'sprite-daemon)
 (require 'sprite-mcp)
 
 (setq sprite-instance-id "work")

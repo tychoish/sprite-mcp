@@ -32,6 +32,6 @@ jobs:
       - name: Run Tests
         uses: tychoish/elisp-ci@v0.1.0
         with:
-          runner: elpaish
+          runner: ert
           dependencies: "sprite mcpkit"
           test-files: "test/test-sprite-mcp.el"

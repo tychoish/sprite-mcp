@@ -58,6 +58,7 @@
 (require 'subr-x)
 (require 'map)
 (require 'sprite)
+(require 'sprite-daemon)
 
 ;; mcpkit-proxy.el is an optional, sibling-repo dependency: only needed
 ;; on the parent side, to register/unregister the reverse-proxy route.
