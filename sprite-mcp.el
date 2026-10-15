@@ -2,7 +2,7 @@
 
 ;; Author: Sam Kleinman
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (seq "2.24") (sprite "0.1.0"))
+;; Package-Requires: ((emacs "29.1") (seq "2.24") (sprite "0.1.0") (mcpkit "0.1.0"))
 ;; URL: https://github.com/tychoish/sprite-mcp
 ;; Keywords: tools, daemon, processes
 
@@ -59,14 +59,8 @@
 (require 'map)
 (require 'sprite)
 (require 'sprite-daemon)
-
-;; mcpkit-proxy.el is an optional, sibling-repo dependency: only needed
-;; on the parent side, to register/unregister the reverse-proxy route.
-;; We do not require it at top level so this file byte-compiles cleanly
-;; even when mcpkit-proxy is not on `load-path'; it is soft-required at
-;; runtime, immediately before use.
-(declare-function mcpkit-proxy-register-route "mcpkit-proxy" (target-id port))
-(declare-function mcpkit-proxy-unregister-route "mcpkit-proxy" (target-id))
+(require 'mcpkit)
+(require 'mcpkit-proxy)
 
 ;;;; Customization
 
@@ -208,10 +202,6 @@ Returns a `sprite-mcp' struct."
                         t))
               (error "sprite-mcp-spawn: failed to start mcpkit service in sprite %s"
                      full-name))
-            (require 'mcpkit-proxy nil t)
-            (unless (fboundp 'mcpkit-proxy-register-route)
-              (error "sprite-mcp-spawn: mcpkit-proxy-register-route unavailable; \
-is mcpkit-proxy.el on `load-path'?"))
             (mcpkit-proxy-register-route id port)
             (let ((entry (sprite-mcp--make :sprite-id id
                                            :full-name full-name
@@ -256,9 +246,7 @@ a clear `error'."
       (error
        (message "sprite-mcp-kill: failed to stop mcpkit service in %s: %s"
                 full-name (error-message-string err))))
-    (require 'mcpkit-proxy nil t)
-    (when (fboundp 'mcpkit-proxy-unregister-route)
-      (mcpkit-proxy-unregister-route id))
+    (mcpkit-proxy-unregister-route id)
     (condition-case err
         (sprite-stop full-name)
       (error
