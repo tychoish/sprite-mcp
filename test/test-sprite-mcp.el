@@ -39,8 +39,6 @@
 (require 'sprite-daemon)
 (require 'sprite-mcp)
 
-(setq sprite-instance-id "work")
-
 ;;;; Helpers
 
 (defmacro sprite-mcp-test/with-mocks (&rest body)
@@ -59,7 +57,8 @@ per-test hash tables, stubs port allocation to a fixed value, and binds
 is mocked, so nothing ever actually invokes git against it) scratch
 temp directory, cleaned up afterwards."
   (declare (indent 0))
-  `(let ((sprite-mcp--registry (make-hash-table :test #'equal))
+  `(let ((sprite-instance-id "work")
+         (sprite-mcp--registry (make-hash-table :test #'equal))
          (sprite--registry (make-hash-table :test #'equal))
          (repo-root (make-temp-file "sprite-mcp-test-repo-" t))
          (git-calls nil)
