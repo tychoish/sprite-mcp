@@ -57,6 +57,7 @@
 (require 'seq)
 (require 'subr-x)
 (require 'map)
+(require 'logx)
 (require 'sprite)
 (require 'sprite-daemon)
 (require 'mcpkit)
@@ -244,14 +245,20 @@ a clear `error'."
          full-name
          `(progn (require 'mcpkit) (mcpkit-stop-service ',service-sym) t))
       (error
-       (message "sprite-mcp-kill: failed to stop mcpkit service in %s: %s"
-                full-name (error-message-string err))))
+       (logx-warn :cat 'sprite
+                  :msg (format "Failed to stop mcpkit service in %s: %s"
+                               full-name (error-message-string err))
+                  :sprite full-name
+                  :error (error-message-string err))))
     (mcpkit-proxy-unregister-route id)
     (condition-case err
         (sprite-stop full-name)
       (error
-       (message "sprite-mcp-kill: failed to stop sprite daemon %s: %s"
-                full-name (error-message-string err))))
+       (logx-warn :cat 'sprite
+                  :msg (format "Failed to stop sprite daemon %s: %s"
+                               full-name (error-message-string err))
+                  :sprite full-name
+                  :error (error-message-string err))))
     (when cleanup-worktree
       (sprite-mcp--git-worktree-remove (sprite-mcp-repo-root entry)
                                        (sprite-mcp-worktree entry)))
@@ -281,8 +288,11 @@ sweep from continuing on to the rest."
       (condition-case err
           (sprite-mcp-kill entry)
         (error
-         (message "sprite-mcp-reap-idle: failed to kill %s: %s"
-                  (sprite-mcp-sprite-id entry) (error-message-string err)))))))
+         (logx-warn :cat 'sprite
+                    :msg (format "Failed to kill idle sprite %s: %s"
+                                 (sprite-mcp-sprite-id entry) (error-message-string err))
+                    :sprite (sprite-mcp-sprite-id entry)
+                    :error (error-message-string err)))))))
 
 (defvar sprite-mcp--idle-timer nil
   "Timer that periodically runs `sprite-mcp-reap-idle'.")
