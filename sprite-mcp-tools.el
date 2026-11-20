@@ -62,9 +62,11 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'subr-x)
+(require 'server)
 (require 'sprite)
 (require 'sprite-daemon)
 (require 'mcpkit)
+(require 'mcpkit-proxy)
 
 ;;;; Customization and state
 
@@ -246,6 +248,35 @@ DIRECTORY, plus its \"lisp\" subdirectory when present, to `load-path'."
 
 ;;;; Tool handlers
 
+(defun sprite-mcp-tools--service-form (service-sym port)
+  "Return the form that starts an mcpkit service SERVICE-SYM on PORT."
+  `(progn
+     (require 'mcpkit)
+     (mcpkit-define-service ',service-sym
+       :port ,port
+       :description ,(format "sprite service %s" service-sym))
+     (mcpkit-start-service ',service-sym :on-collision 'error :port ,port)
+     (require 'mcpkit-editing)
+     (mcpkit-editing-register-tools ',service-sym)
+     t))
+
+(defun sprite-mcp-tools--start-service (full-name port timeout)
+  "Start an mcpkit service on PORT inside sprite FULL-NAME; return non-nil on success."
+  (eq :ok (car (sprite-mcp-tools--remote-eval
+                full-name
+                (sprite-mcp-tools--service-form (intern full-name) port)
+                timeout))))
+
+(defun sprite-mcp-tools--expose (full-name timeout)
+  "Start an MCP service in sprite FULL-NAME and register its proxy route.
+The route's target id is FULL-NAME.  Return the port, or nil when the
+service could not be started (the sprite stays usable through sprite_eval)."
+  (mcpkit-proxy-unregister-route full-name)
+  (let ((port (mcpkit-allocate-free-port)))
+    (when (sprite-mcp-tools--start-service full-name port timeout)
+      (mcpkit-proxy-register-route full-name port)
+      port)))
+
 (defun sprite-mcp-tools--start (args)
   "Handle `sprite_start' with ARGS."
   (sprite-mcp-tools--guard
@@ -266,6 +297,7 @@ DIRECTORY, plus its \"lisp\" subdirectory when present, to `load-path'."
                   :error (format "Sprite started but directory setup failed: %s" dir-err))
           (list :ok t
                 :name full
+                :target_id (and (sprite-mcp-tools--expose full timeout) full)
                 :unique_name (sprite-unique-name s)
                 :pid (sprite-mcp-tools--pid full)
                 :directory (let ((r (sprite-mcp-tools--remote-eval
@@ -313,6 +345,7 @@ DIRECTORY, plus its \"lisp\" subdirectory when present, to `load-path'."
                                  dir-err))
           (list :ok t
                 :name full
+                :target_id (and (sprite-mcp-tools--expose full timeout) full)
                 :pid (sprite-mcp-tools--pid full)
                 :directory (and dir (file-name-as-directory (expand-file-name dir)))))))))
 
@@ -321,6 +354,7 @@ DIRECTORY, plus its \"lisp\" subdirectory when present, to `load-path'."
   (sprite-mcp-tools--guard
     (let* ((name (sprite-mcp-tools--string-arg args :name))
            (full (sprite-mcp-tools--resolve name)))
+      (mcpkit-proxy-unregister-route full)
       (when (sprite--running-p full)
         (sprite-stop full))
       (if (sprite-mcp-tools--wait-stopped full 10)
@@ -375,13 +409,37 @@ That is: no files, or only a DECOMMISSIONED marker.  Otherwise nil."
      ((null files) "empty")
      ((equal files '("DECOMMISSIONED")) "decommissioned-marker-only"))))
 
+(defun sprite-mcp-tools--server-file-refused-p (file)
+  "Return non-nil when the TCP server FILE names a refused connection."
+  (when-let* ((line (with-temp-buffer
+                      (insert-file-contents file nil 0 80)
+                      (car (split-string (buffer-string) "\n"))))
+              ((string-match "\\`\\([^: ]+\\):\\([0-9]+\\)" line)))
+    (condition-case nil
+        (progn (delete-process
+                (make-network-process :name "sprite-stale-probe" :noquery t
+                                      :host (match-string 1 line)
+                                      :service (string-to-number (match-string 2 line))))
+               nil)
+      (file-error t))))
+
+(defun sprite-mcp-tools--stale-server-files ()
+  "Return server files in `server-auth-dir' whose connections are refused.
+Protected (current instance or parent) names are never returned."
+  (when (file-directory-p server-auth-dir)
+    (seq-filter
+     (lambda (f)
+       (and (not (member (file-name-nondirectory f) (sprite-mcp-tools--protected-names)))
+            (sprite-mcp-tools--server-file-refused-p f)))
+     (directory-files server-auth-dir t directory-files-no-dot-files-regexp))))
+
 (defun sprite-mcp-tools--cleanup-stale (args)
   "Handle `sprite_cleanup_stale' with ARGS.
 Dry-run unless :dry_run is explicitly false."
   (sprite-mcp-tools--guard
     (let* ((dry-run (or (not (plist-member args :dry_run))
                         (not (memq (plist-get args :dry_run) '(nil :json-false)))))
-           found removed)
+           found removed stale-files)
       (dolist (full (sprite--discover-state-dirs))
         (unless (or (member full (sprite-mcp-tools--protected-names))
                     (sprite--running-p full))
@@ -397,12 +455,17 @@ Dry-run unless :dry_run is explicitly false."
                         (delete-file (expand-file-name "DECOMMISSIONED" dir)))
                       (delete-directory dir)
                       (sprite--registry-remove full)
+                      (mcpkit-proxy-unregister-route full)
                       (remhash full sprite-mcp-tools--directories)
                       (push entry removed))
                   (error (setf (plist-get (car found) :error)
                                (error-message-string err)))))))))
+      (let ((files (sprite-mcp-tools--stale-server-files)))
+        (unless dry-run (mapc #'delete-file files))
+        (setq stale-files files))
       (list :ok t
             :dry_run (if dry-run t :json-false)
+            :stale_server_files (vconcat stale-files)
             :found (vconcat (nreverse found))
             :removed (vconcat (nreverse removed))))))
 

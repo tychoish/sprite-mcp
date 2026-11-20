@@ -41,7 +41,7 @@
 
 (defmacro sprite-mcp-tools-test/with-env (&rest body)
   "Run BODY with a hermetic sprite state dir and mocked sprite lifecycle.
-Binds `running' (list of running full names), `calls' (list of
+Binds `services' (alist of full name to MCP port started), `running' (list of running full names), `calls' (list of
 \(:create|:stop|:restart NAME) in most-recent-first order) and
 `root' (the temp `user-emacs-directory')."
   (declare (indent 0))
@@ -55,7 +55,8 @@ Binds `running' (list of running full names), `calls' (list of
           (sprite-mcp-tools-directory nil)
           (load-path load-path)
           (running nil)
-          (calls nil))
+          (calls nil)
+          (services nil))
      (unwind-protect
          (cl-letf (((symbol-function 'sprite-create)
                     (lambda (unique-name &rest _)
@@ -78,6 +79,11 @@ Binds `running' (list of running full names), `calls' (list of
                       (cl-pushnew name running :test #'equal)))
                    ((symbol-function 'sprite--running-p)
                     (lambda (name) (and (member name running) t)))
+                   ((symbol-function 'sprite-mcp-tools--start-service)
+                    (lambda (full port _timeout)
+                      (and (member full running)
+                           (push (cons full port) services)
+                           t)))
                    ((symbol-function 'sprite-mcp-tools--call)
                     (lambda (full form _timeout)
                       (when (member full running)
@@ -339,6 +345,83 @@ Binds `running' (list of running full names), `calls' (list of
         (should (file-directory-p d))))))
 
 ;;;; Integration (real daemons)
+
+;;;; Proxy routes
+
+(ert-deftest sprite-mcp-tools/start-registers-proxy-route ()
+  (sprite-mcp-tools-test/with-env
+    (unwind-protect
+        (let ((res (sprite-mcp-tools--start (list :name "px"))))
+          (should (equal "work.0.px" (plist-get res :target_id)))
+          (should (equal (cdr (assoc "work.0.px" services))
+                         (map-elt mcpkit-proxy--routes "work.0.px"))))
+      (mcpkit-proxy-unregister-route "work.0.px"))))
+
+(ert-deftest sprite-mcp-tools/start-succeeds-without-route-when-service-fails ()
+  (sprite-mcp-tools-test/with-env
+    (cl-letf (((symbol-function 'sprite-mcp-tools--start-service) (lambda (&rest _) nil)))
+      (let ((res (sprite-mcp-tools--start (list :name "nr"))))
+        (should (eq t (plist-get res :ok)))
+        (should-not (plist-get res :target_id))
+        (should-not (map-elt mcpkit-proxy--routes "work.0.nr"))))))
+
+(ert-deftest sprite-mcp-tools/stop-unregisters-proxy-route ()
+  (sprite-mcp-tools-test/with-env
+    (sprite-mcp-tools--start (list :name "ps"))
+    (should (map-elt mcpkit-proxy--routes "work.0.ps"))
+    (sprite-mcp-tools--stop (list :name "ps"))
+    (should-not (map-elt mcpkit-proxy--routes "work.0.ps"))))
+
+(ert-deftest sprite-mcp-tools/restart-reregisters-proxy-route-on-new-port ()
+  (sprite-mcp-tools-test/with-env
+    (unwind-protect
+        (progn
+          (sprite-mcp-tools--start (list :name "pr"))
+          (let ((res (sprite-mcp-tools--restart (list :name "pr"))))
+            (should (equal "work.0.pr" (plist-get res :target_id)))
+            (should (equal (car services)
+                           (cons "work.0.pr" (map-elt mcpkit-proxy--routes "work.0.pr"))))
+            (should (= 2 (length services)))))
+      (mcpkit-proxy-unregister-route "work.0.pr"))))
+
+(ert-deftest sprite-mcp-tools/service-form-starts-and-registers-editing-tools ()
+  (let ((form (sprite-mcp-tools--service-form 'sprite-x 4242)))
+    (should (string-match-p "mcpkit-start-service" (format "%S" form)))
+    (should (string-match-p "4242" (format "%S" form)))
+    (should (string-match-p "mcpkit-editing-register-tools" (format "%S" form)))))
+
+;;;; Stale server files
+
+(ert-deftest sprite-mcp-tools/cleanup-flags-refused-server-files ()
+  (sprite-mcp-tools-test/with-env
+    (let* ((server-auth-dir (file-name-as-directory (make-temp-file "srv-" t)))
+           (port (mcpkit-allocate-free-port))
+           (stale (expand-file-name "work.0.gone" server-auth-dir)))
+      (unwind-protect
+          (progn
+            (write-region (format "127.0.0.1:%s 1\nkey" port) nil stale)
+            (let ((res (sprite-mcp-tools--cleanup-stale nil)))
+              (should (equal (list stale) (append (plist-get res :stale_server_files) nil)))
+              (should (file-exists-p stale)))
+            (sprite-mcp-tools--cleanup-stale (list :dry_run :json-false))
+            (should-not (file-exists-p stale)))
+        (delete-directory server-auth-dir t)))))
+
+(ert-deftest sprite-mcp-tools/cleanup-keeps-live-and-protected-server-files ()
+  (sprite-mcp-tools-test/with-env
+    (let* ((server-auth-dir (file-name-as-directory (make-temp-file "srv-" t)))
+           (srv (make-network-process :name "live" :server t :host 'local
+                                      :service t :noquery t :family 'ipv4))
+           (live (expand-file-name "work.0.live" server-auth-dir))
+           (prot (expand-file-name "work" server-auth-dir)))
+      (unwind-protect
+          (progn
+            (write-region (format "127.0.0.1:%s 1\nk" (process-contact srv :service)) nil live)
+            (write-region "127.0.0.1:1 1\nk" nil prot)
+            (should (zerop (length (plist-get (sprite-mcp-tools--cleanup-stale nil)
+                                              :stale_server_files)))))
+        (delete-process srv)
+        (delete-directory server-auth-dir t)))))
 
 (ert-deftest sprite-mcp-tools/integration-create-eval-restart-stop ()
   "Real create/eval/restart/stop cycle; skipped unless SPRITE_MCP_INTEGRATION=1.
