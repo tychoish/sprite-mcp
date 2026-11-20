@@ -246,6 +246,129 @@ DIRECTORY, plus its \"lisp\" subdirectory when present, to `load-path'."
     (or (and (eq :ok (car res)) (ignore-errors (read (cadr res))))
         (when-let* ((s (sprite--registry-get full-name))) (sprite-pid s)))))
 
+;;;; Startup options and test running
+
+(defvar sprite-mcp-tools--options (make-hash-table :test #'equal)
+  "Map of sprite full name to the startup options it was last set up with.")
+
+(defvar sprite-mcp-tools-test-timeout 120
+  "Default seconds `sprite_run_tests' waits for a run to finish.")
+
+(defun sprite-mcp-tools--list-arg (args key)
+  "Return the list of strings under KEY in ARGS (JSON array), or nil.
+Signal `user-error' when KEY holds anything but strings."
+  (let ((v (plist-get args key)))
+    (when v
+      (unless (or (vectorp v) (listp v))
+        (user-error "%s must be an array of strings" key))
+      (let ((l (append v nil)))
+        (dolist (e l)
+          (unless (and (stringp e) (not (string-empty-p e)))
+            (user-error "%s must contain only non-empty strings" key)))
+        l))))
+
+(defun sprite-mcp-tools--parse-options (args)
+  "Validate and return the startup options plist from ARGS.
+Keys: :load_path (existing dirs), :require (features), :load (existing files)."
+  (let ((paths (mapcar #'expand-file-name (sprite-mcp-tools--list-arg args :load_path)))
+        (files (mapcar #'expand-file-name (sprite-mcp-tools--list-arg args :load)))
+        (features (sprite-mcp-tools--list-arg args :require)))
+    (dolist (d paths)
+      (unless (file-directory-p d) (user-error "load_path entry is not a directory: %s" d)))
+    (dolist (f files)
+      (unless (file-regular-p f) (user-error "load entry is not a file: %s" f)))
+    (list :load_path paths :require features :load files)))
+
+(defun sprite-mcp-tools--options-form (opts)
+  "Return the form applying startup options OPTS to a sprite."
+  (let ((paths (plist-get opts :load_path))
+        (features (mapcar #'intern (plist-get opts :require)))
+        (files (plist-get opts :load)))
+    `(progn
+       (let ((new ',paths))
+         (setq load-path (append new (seq-remove (lambda (p) (member p new)) load-path))))
+       (dolist (f ',features) (require f))
+       (dolist (f ',files) (load f nil t))
+       t)))
+
+(defun sprite-mcp-tools--apply-options (full-name opts timeout)
+  "Apply OPTS to FULL-NAME; return nil on success or an error string."
+  (when (seq-some #'identity (list (plist-get opts :load_path)
+                                   (plist-get opts :require)
+                                   (plist-get opts :load)))
+    (let ((res (sprite-mcp-tools--remote-eval
+                full-name (sprite-mcp-tools--options-form opts) timeout)))
+      (if (eq :ok (car res))
+          (progn (puthash full-name opts sprite-mcp-tools--options) nil)
+        (cadr res)))))
+
+(defun sprite-mcp-tools--run-tests-form (load-path-dirs features files selector)
+  "Return the form that runs ERT SELECTOR after loading FEATURES and FILES.
+LOAD-PATH-DIRS are prepended to `load-path' first.  The form returns
+\(:passed N :failed N :skipped N :total N :failing LIST)."
+  `(progn
+     (require 'ert)
+     (let ((new ',load-path-dirs))
+       (setq load-path (append new (seq-remove (lambda (p) (member p new)) load-path))))
+     (dolist (f ',(mapcar #'intern features)) (require f))
+     (dolist (f ',files) (load f nil t))
+     (let* ((stats (ert-run-tests ',selector #'ignore))
+            (tests (ert--stats-tests stats))
+            (results (ert--stats-test-results stats))
+            (passed 0) (failed 0) (skipped 0) failing)
+       (dotimes (i (length tests))
+         (let ((r (aref results i)) (test (aref tests i)))
+           (cond
+            ((null r))
+            ((ert-test-skipped-p r) (cl-incf skipped))
+            ((ert-test-result-expected-p test r) (cl-incf passed))
+            (t (cl-incf failed)
+               (push (list :name (symbol-name (ert-test-name test))
+                           :message (truncate-string-to-width
+                                     (prin1-to-string
+                                      (and (ert-test-result-with-condition-p r)
+                                           (ert-test-result-with-condition-condition r)))
+                                     400))
+                     failing)))))
+       (list :passed passed :failed failed :skipped skipped
+             :total (length tests) :failing (nreverse failing)))))
+
+(defun sprite-mcp-tools--parse-selector (selector)
+  "Return the ERT selector for the string SELECTOR (nil or \"\" means t).
+A string starting with an open paren is read as an ERT selector form;
+anything else is a test-name regexp."
+  (cond
+   ((or (null selector) (equal selector "") (equal selector "t")) t)
+   ((not (stringp selector)) (user-error "selector must be a string"))
+   ((string-prefix-p "(" selector) (car (read-from-string selector)))
+   (t selector)))
+
+(defun sprite-mcp-tools--run-tests (args)
+  "Handle `sprite_run_tests' with ARGS."
+  (sprite-mcp-tools--guard
+    (let* ((name (sprite-mcp-tools--string-arg args :name))
+           (full (sprite-mcp-tools--resolve name))
+           (opts (sprite-mcp-tools--parse-options
+                  (list :load_path (plist-get args :load_path)
+                        :require (plist-get args :main_features)
+                        :load (plist-get args :test_files))))
+           (selector (sprite-mcp-tools--parse-selector (plist-get args :selector)))
+           (timeout (let ((v (plist-get args :timeout)))
+                      (if (and (numberp v) (> v 0)) v sprite-mcp-tools-test-timeout)))
+           (res (sprite-mcp-tools--remote-eval
+                 full
+                 (sprite-mcp-tools--run-tests-form
+                  (plist-get opts :load_path) (plist-get opts :require)
+                  (plist-get opts :load) selector)
+                 timeout)))
+      (if (eq :ok (car res))
+          (let ((r (read (cadr res))))
+            (append (list :ok t :name full
+                          :success (if (zerop (plist-get r :failed)) t :json-false))
+                    (plist-put (copy-sequence r) :failing
+                               (vconcat (plist-get r :failing)))))
+        (list :ok nil :name full :error (cadr res))))))
+
 ;;;; Tool handlers
 
 (defun sprite-mcp-tools--service-form (service-sym port)
@@ -282,19 +405,22 @@ service could not be started (the sprite stays usable through sprite_eval)."
   (sprite-mcp-tools--guard
     (let* ((name (sprite-mcp-tools--string-arg args :name))
            (dir (plist-get args :directory))
-           (timeout (sprite-mcp-tools--timeout args)))
+           (timeout (sprite-mcp-tools--timeout args))
+           opts)
       (when (or (string-match-p "\\." name) (string-match-p "[[:space:]/]" name))
         (user-error "name must be a short name without dots, spaces or slashes: %s" name))
       (when dir (sprite-mcp-tools--check-directory dir))
+      (setq opts (sprite-mcp-tools--parse-options args))
       (when (member name (sprite-mcp-tools--protected-names))
         (user-error "Refusing to use the name of the current instance or its parent: %s"
                     name))
       (let* ((s (sprite-create name :timeout timeout))
              (full (sprite-name s))
-             (dir-err (when dir (sprite-mcp-tools--apply-directory full dir timeout))))
+             (dir-err (or (when dir (sprite-mcp-tools--apply-directory full dir timeout))
+                          (sprite-mcp-tools--apply-options full opts timeout))))
         (if dir-err
             (list :ok nil :name full
-                  :error (format "Sprite started but directory setup failed: %s" dir-err))
+                  :error (format "Sprite started but setup failed: %s" dir-err))
           (list :ok t
                 :name full
                 :target_id (and (sprite-mcp-tools--expose full timeout) full)
@@ -338,10 +464,12 @@ service could not be started (the sprite stays usable through sprite_eval)."
       (sprite-restart full)
       (unless (sprite-mcp-tools--wait-ready full timeout)
         (user-error "Sprite %s did not answer within %ss after restart" full timeout))
-      (let ((dir-err (when dir (sprite-mcp-tools--apply-directory full dir timeout))))
+      (let ((dir-err (or (when dir (sprite-mcp-tools--apply-directory full dir timeout))
+                         (sprite-mcp-tools--apply-options
+                          full (gethash full sprite-mcp-tools--options) timeout))))
         (if dir-err
             (list :ok nil :name full
-                  :error (format "Sprite restarted but directory setup failed: %s"
+                  :error (format "Sprite restarted but setup failed: %s"
                                  dir-err))
           (list :ok t
                 :name full
@@ -359,6 +487,7 @@ service could not be started (the sprite stays usable through sprite_eval)."
         (sprite-stop full))
       (if (sprite-mcp-tools--wait-stopped full 10)
           (progn (remhash full sprite-mcp-tools--directories)
+                 (remhash full sprite-mcp-tools--options)
                  (list :ok t :name full :running nil))
         (list :ok nil :name full :running t
               :error (format "Sprite %s is still running after 10s" full))))))
@@ -480,13 +609,28 @@ Dry-run unless :dry_run is explicitly false."
 (mcpkit-register-autostart 'sprite :on-collision 'namespace)
 
 (mcpkit-register-tool 'sprite_start 'sprite
-  :description "Start an ephemeral, isolated Emacs daemon (a sprite) for per-git-worktree ERT or byte-compile checks.  Use this instead of evaluating in the user's main daemon, which is NOT isolated.  If `directory' is given, the sprite's default-directory is set to it and it (plus <directory>/lisp when present) is prepended to load-path.  Returns the full name (use it, or the short name, with the other sprite_* tools), pid and directory.  Stop it with sprite_stop when done."
+  :description "Start an ephemeral, isolated Emacs daemon (a sprite) for per-git-worktree ERT or byte-compile checks.  Use this instead of evaluating in the user's main daemon, which is NOT isolated.  If `directory' is given, the sprite's default-directory is set to it and it (plus <directory>/lisp when present) is prepended to load-path.  Optional `load_path', `require' and `load' arrays prepare the sprite non-interactively (they are re-applied on sprite_restart).  Returns the full name (use it, or the short name, with the other sprite_* tools), pid, directory and proxy target_id.  Stop it with sprite_stop when done."
   :input-schema '(:type "object"
                   :properties (:name (:type "string" :description "Short unique name for the sprite (no dots), e.g. wt-foo")
                                :directory (:type "string" :description "Optional worktree directory to set as default-directory and add to load-path")
+                               :load_path (:type "array" :items (:type "string") :description "Optional extra existing directories to prepend to load-path (e.g. a ~/src/<pkg> checkout)")
+                               :require (:type "array" :items (:type "string") :description "Optional features to require after setup, in order")
+                               :load (:type "array" :items (:type "string") :description "Optional existing files to load after the features, in order")
                                :timeout (:type "number" :description "Seconds to wait for the daemon to become ready (default 30)"))
                   :required ["name"])
   (sprite-mcp-tools--start args))
+
+(mcpkit-register-tool 'sprite_run_tests 'sprite
+  :description "Run ERT tests inside a sprite started with sprite_start and return a structured summary: success, passed/failed/skipped/total counts and the failing tests (name and truncated condition).  `main_features' are required and `test_files' loaded first; `load_path' dirs are prepended.  `selector' is a test-name regexp, or an ERT selector form starting with an open paren, e.g. \"(tag foo)\"; default runs all tests loaded.  Run it in a fresh or restarted sprite so earlier tests do not pollute the run.  Refuses the current Emacs instance and its parent."
+  :input-schema '(:type "object"
+                  :properties (:name (:type "string" :description "Full or short sprite name")
+                               :main_features (:type "array" :items (:type "string") :description "Features to require (the code under test)")
+                               :test_files (:type "array" :items (:type "string") :description "Existing ERT test files to load")
+                               :load_path (:type "array" :items (:type "string") :description "Extra directories to prepend to load-path")
+                               :selector (:type "string" :description "Regexp or ERT selector form (default: all)")
+                               :timeout (:type "number" :description "Seconds to wait for the run (default 120)"))
+                  :required ["name"])
+  (sprite-mcp-tools--run-tests args))
 
 (mcpkit-register-tool 'sprite_eval 'sprite
   :description "Evaluate Emacs Lisp (one or more forms; the last value is returned, printed) inside a sprite started with sprite_start, e.g. to run ERT tests or byte-compile files in isolation.  `name' may be the full name or the short name.  Returns the printed result or the error text; a nil result is distinguishable from a failure.  Evaluating in the user's main daemon instead is NOT isolated.  Refuses the current Emacs instance and its parent."

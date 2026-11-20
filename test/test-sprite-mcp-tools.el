@@ -423,6 +423,108 @@ Binds `services' (alist of full name to MCP port started), `running' (list of ru
         (delete-process srv)
         (delete-directory server-auth-dir t)))))
 
+;;;; Startup options
+
+(ert-deftest sprite-mcp-tools/start-rejects-bad-options ()
+  (sprite-mcp-tools-test/with-env
+    (should-not (plist-get (sprite-mcp-tools--start
+                            (list :name "o1" :load_path ["/nonexistent/x"])) :ok))
+    (should-not (plist-get (sprite-mcp-tools--start
+                            (list :name "o2" :load ["/nonexistent/x.el"])) :ok))
+    (should-not (plist-get (sprite-mcp-tools--start
+                            (list :name "o3" :require [1])) :ok))
+    (should-not (member '(:create "work.0.o1") calls))))
+
+(ert-deftest sprite-mcp-tools/start-applies-and-restart-reapplies-options ()
+  (sprite-mcp-tools-test/with-env
+    (let* ((dir (file-name-as-directory (make-temp-file "lp-" t)))
+           (file (expand-file-name "loadme.el" dir)))
+      (unwind-protect
+          (progn
+            (write-region ";;; x -*- lexical-binding: t; -*-
+(setq sprite-mcp-tools-test--loaded (1+ (or (bound-and-true-p sprite-mcp-tools-test--loaded) 0)))"
+                          nil file)
+            (defvar sprite-mcp-tools-test--loaded nil)
+            (setq sprite-mcp-tools-test--loaded nil)
+            (let ((res (sprite-mcp-tools--start
+                        (list :name "opt" :load_path (vector dir)
+                              :require ["subr-x"] :load (vector file)))))
+              (should (eq t (plist-get res :ok)))
+              (should (member (directory-file-name dir)
+                              (mapcar #'directory-file-name load-path)))
+              (should (= 1 sprite-mcp-tools-test--loaded)))
+            (sprite-mcp-tools--restart (list :name "opt"))
+            (should (= 2 sprite-mcp-tools-test--loaded)))
+        (delete-directory dir t)
+        (setq load-path (delete dir load-path))
+        (mcpkit-proxy-unregister-route "work.0.opt")))))
+
+(ert-deftest sprite-mcp-tools/start-reports-failing-option-setup ()
+  (sprite-mcp-tools-test/with-env
+    (let ((res (sprite-mcp-tools--start (list :name "bad" :require ["no-such-feature-xyz"]))))
+      (should-not (plist-get res :ok))
+      (should (string-match-p "no-such-feature-xyz" (plist-get res :error))))))
+
+;;;; sprite_run_tests
+
+(defmacro sprite-mcp-tools-test/with-test-file (var &rest body)
+  "Bind VAR to a temp ERT file with one passing, one failing, one skipped test."
+  (declare (indent 1))
+  `(let ((,var (make-temp-file "smt-" nil ".el")))
+     (unwind-protect
+         (progn
+           (write-region ";;; x -*- lexical-binding: t; -*-
+(require 'ert)
+(ert-deftest smt-fixture/passes () (should t))
+(ert-deftest smt-fixture/fails () (should (equal 1 2)))
+(ert-deftest smt-fixture/skips () (ert-skip \"nope\"))
+" nil ,var)
+           ,@body)
+       (dolist (n '(smt-fixture/passes smt-fixture/fails smt-fixture/skips))
+         (ert-delete-test n))
+       (delete-file ,var))))
+
+(ert-deftest sprite-mcp-tools/run-tests-reports-pass-fail-and-names ()
+  (sprite-mcp-tools-test/with-env
+    (sprite-mcp-tools-test/with-test-file file
+      (sprite-mcp-tools--start (list :name "rt"))
+      (let ((res (sprite-mcp-tools--run-tests
+                  (list :name "rt" :test_files (vector file) :selector "^smt-fixture/"))))
+        (should (eq t (plist-get res :ok)))
+        (should (eq :json-false (plist-get res :success)))
+        (should (= 1 (plist-get res :passed)))
+        (should (= 1 (plist-get res :failed)))
+        (should (= 1 (plist-get res :skipped)))
+        (should (= 3 (plist-get res :total)))
+        (should (equal "smt-fixture/fails"
+                       (plist-get (aref (plist-get res :failing) 0) :name)))))
+    (mcpkit-proxy-unregister-route "work.0.rt")))
+
+(ert-deftest sprite-mcp-tools/run-tests-selector-form-and-success ()
+  (sprite-mcp-tools-test/with-env
+    (sprite-mcp-tools-test/with-test-file file
+      (sprite-mcp-tools--start (list :name "rs"))
+      (let ((res (sprite-mcp-tools--run-tests
+                  (list :name "rs" :test_files (vector file)
+                        :selector "(or \"smt-fixture/passes\" \"smt-fixture/skips\")"))))
+        (should (eq t (plist-get res :success)))
+        (should (= 0 (length (plist-get res :failing))))
+        (should (= 2 (plist-get res :total)))))
+    (mcpkit-proxy-unregister-route "work.0.rs")))
+
+(ert-deftest sprite-mcp-tools/run-tests-load-error-and-bad-input-are-structured ()
+  (sprite-mcp-tools-test/with-env
+    (sprite-mcp-tools--start (list :name "re"))
+    (should-not (plist-get (sprite-mcp-tools--run-tests
+                            (list :name "re" :main_features ["no-such-feature-xyz"])) :ok))
+    (should-not (plist-get (sprite-mcp-tools--run-tests
+                            (list :name "re" :test_files ["/nonexistent.el"])) :ok))
+    (should-not (plist-get (sprite-mcp-tools--run-tests (list :name "unknown")) :ok))
+    (mcpkit-proxy-unregister-route "work.0.re")))
+
+(ert-deftest sprite-mcp-tools/registers-run-tests-tool ()
+  (should (gethash "sprite_run_tests" (mcpkit-service-tools (mcpkit-get-service 'sprite)))))
+
 (ert-deftest sprite-mcp-tools/integration-create-eval-restart-stop ()
   "Real create/eval/restart/stop cycle; skipped unless SPRITE_MCP_INTEGRATION=1.
 Run it only in an isolated batch Emacs with its own HOME and
@@ -458,6 +560,39 @@ spawns real daemons."
                                           :result)))))
       (sprite-mcp-tools--stop (list :name full))
       (should-not (sprite--running-p full))
+      (delete-directory dir t))))
+
+(ert-deftest sprite-mcp-tools/integration-options-routes-and-run-tests ()
+  "Real sprite: startup options, proxy route and sprite_run_tests.
+Skipped unless SPRITE_MCP_INTEGRATION=1; see the test above for isolation."
+  (skip-unless (equal "1" (getenv "SPRITE_MCP_INTEGRATION")))
+  (let* ((dir (make-temp-file "sprite-mcp-it2-" t))
+         (tfile (expand-file-name "it-tests.el" dir))
+         (_ (write-region ";;; x -*- lexical-binding: t; -*-
+(require 'ert)
+(ert-deftest it-fixture/ok () (should (featurep 'subr-x)))
+(ert-deftest it-fixture/bad () (should (= 1 2)))
+" nil tfile))
+         (start (sprite-mcp-tools--start
+                 (list :name "it2" :directory dir :require ["subr-x"] :timeout 60
+                       ;; the isolated sprite has no config: hand it our load-path
+                       :load_path (vconcat (seq-filter (function file-directory-p)
+                                                       (mapcar (function expand-file-name) load-path))))))
+         (full (plist-get start :name)))
+    (unwind-protect
+        (progn
+          (should (eq t (plist-get start :ok)))
+          (should (equal full (plist-get start :target_id)))
+          (should (map-elt mcpkit-proxy--routes full))
+          (let ((res (sprite-mcp-tools--run-tests
+                      (list :name "it2" :test_files (vector tfile)
+                            :selector "^it-fixture/" :timeout 60))))
+            (should (= 1 (plist-get res :passed)))
+            (should (= 1 (plist-get res :failed)))
+            (should (equal "it-fixture/bad"
+                           (plist-get (aref (plist-get res :failing) 0) :name)))))
+      (sprite-mcp-tools--stop (list :name full))
+      (should-not (map-elt mcpkit-proxy--routes full))
       (delete-directory dir t))))
 
 (provide 'test-sprite-mcp-tools)

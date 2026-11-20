@@ -98,7 +98,8 @@ Tear it down explicitly when done, or let the idle reaper reap it once it goes q
 
 | Tool                   | Arguments                                   | Description                                                                                       |
 |------------------------+---------------------------------------------+---------------------------------------------------------------------------------------------------|
-| =sprite_start=         | =name=, =directory=?, =timeout=?            | Start a sprite; with =directory= set =default-directory= and prepend it (and =lisp/=) to =load-path=. |
+| =sprite_start=         | =name=, =directory=?, =load_path=?, =require=?, =load=?, =timeout=? | Start a sprite; with =directory= set =default-directory= and prepend it (and =lisp/=) to =load-path=; then apply extra =load_path=, =require= and =load=. Starts an MCP service and registers a proxy route (=target_id=). |
+| =sprite_run_tests=     | =name=, =main_features=?, =test_files=?, =load_path=?, =selector=?, =timeout=? | Run ERT in a sprite; returns success, passed/failed/skipped/total and failing tests. |
 | =sprite_eval=          | =name=, =expression=, =timeout=?            | Evaluate Lisp in a sprite (full or short name); returns the printed result or the error text.    |
 | =sprite_restart=       | =name=, =directory=?, =timeout=?            | Restart under the same name and re-apply the directory setup (restarted daemons are blank).      |
 | =sprite_stop=          | =name=                                      | Stop the sprite and confirm it is no longer running.                                             |
