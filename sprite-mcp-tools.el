@@ -384,7 +384,8 @@ anything else is a test-name regexp."
      t))
 
 (defun sprite-mcp-tools--start-service (full-name port timeout)
-  "Start an mcpkit service on PORT inside sprite FULL-NAME; return non-nil on success."
+  "Start an mcpkit service on PORT inside sprite FULL-NAME.
+Return non-nil on success."
   (eq :ok (car (sprite-mcp-tools--remote-eval
                 full-name
                 (sprite-mcp-tools--service-form (intern full-name) port)
