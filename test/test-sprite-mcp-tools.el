@@ -29,6 +29,16 @@
 (require 'sprite-daemon)
 (require 'sprite-mcp-tools)
 
+(defun sprite-mcp-tools-test/eval-isolated (form)
+  "Evaluate remote FORM without changing the test runner's buffers."
+  (let ((original-default (default-value 'default-directory)))
+    (unwind-protect
+        (with-temp-buffer
+          (let ((buffer (current-buffer)))
+            (cl-letf (((symbol-function 'buffer-list) (lambda (&rest _) (list buffer))))
+              (eval form t))))
+      (set-default 'default-directory original-default))))
+
 (defmacro sprite-mcp-tools-test/with-env (&rest body)
   "Run BODY with a hermetic sprite state dir and mocked sprite lifecycle.
 Binds `running' (list of running full names), `calls' (list of
@@ -73,7 +83,7 @@ Binds `running' (list of running full names), `calls' (list of
                       (when (member full running)
                         ;; Stand-in for the remote sprite: evaluate locally
                         ;; (state is isolated by the outer let).
-                        (eval form t)))))
+                        (sprite-mcp-tools-test/eval-isolated form)))))
            ,@body)
        (delete-directory root t))))
 
@@ -121,17 +131,21 @@ Binds `running' (list of running full names), `calls' (list of
         (progn
           (make-directory lisp)
           (let ((load-path '("/x")) (default-directory "/") (sprite-mcp-tools-directory nil))
-            (eval (sprite-mcp-tools--setup-form dir) t)
-            (should (equal (file-name-as-directory dir) default-directory))
-            (should (equal (list (directory-file-name dir) lisp "/x") load-path))))
+            (let ((result (sprite-mcp-tools-test/eval-isolated
+                           `(progn ,(sprite-mcp-tools--setup-form dir)
+                                   (list default-directory load-path)))))
+              (should (equal (file-name-as-directory dir) (car result)))
+              (should (equal (list (directory-file-name dir) lisp "/x")
+                             (cadr result))))))
       (delete-directory dir t))))
 
 (ert-deftest sprite-mcp-tools/start-setup-form-skips-missing-lisp-dir ()
   (let ((dir (make-temp-file "wt-" t)))
     (unwind-protect
         (let ((load-path '("/x")) (default-directory "/") (sprite-mcp-tools-directory nil))
-          (eval (sprite-mcp-tools--setup-form dir) t)
-          (should (equal (list (directory-file-name dir) "/x") load-path)))
+          (let ((result (sprite-mcp-tools-test/eval-isolated
+                         `(progn ,(sprite-mcp-tools--setup-form dir) load-path))))
+            (should (equal (list (directory-file-name dir) "/x") result))))
       (delete-directory dir t))))
 
 (ert-deftest sprite-mcp-tools/start-rejects-bad-input-without-signalling ()
