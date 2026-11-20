@@ -1,0 +1,367 @@
+;;; test-sprite-mcp-tools.el --- ERT tests for sprite-mcp-tools.el -*- lexical-binding: t; no-byte-compile: t; -*-
+
+;; Batch run (from the sprite-mcp directory):
+;;   emacs --batch -Q -L . -L ../sprite -l ert -l test/test-sprite-mcp-tools.el \
+;;     --eval '(ert-run-tests-batch-and-exit "sprite-mcp-tools/")'
+;;
+;; The real create/eval/restart/stop cycle runs only with
+;; SPRITE_MCP_INTEGRATION=1 (see the last test).
+
+;;; Commentary:
+;;
+;; Unit tests mock `sprite-create', `sprite-stop', `sprite-restart',
+;; `sprite--running-p' and the single transport function
+;; `sprite-mcp-tools--call' (which here evaluates the wrapped form in
+;; the test Emacs, standing in for the remote sprite).  No daemon is
+;; spawned and the user's Emacs is never contacted.
+
+;;; Code:
+
+(require 'ert)
+(require 'cl-lib)
+(require 'seq)
+(require 'subr-x)
+
+(defvar server-use-tcp)
+(defvar server-auth-dir)
+
+(require 'sprite)
+(require 'sprite-daemon)
+(require 'sprite-mcp-tools)
+
+(defmacro sprite-mcp-tools-test/with-env (&rest body)
+  "Run BODY with a hermetic sprite state dir and mocked sprite lifecycle.
+Binds `running' (list of running full names), `calls' (list of
+\(:create|:stop|:restart NAME) in most-recent-first order) and
+`root' (the temp `user-emacs-directory')."
+  (declare (indent 0))
+  `(let* ((root (file-name-as-directory (make-temp-file "sprite-mcp-tools-" t)))
+          (user-emacs-directory root)
+          (sprite-instance-id "work")
+          (sprite--registry (make-hash-table :test #'equal))
+          (sprite-mcp-tools--directories (make-hash-table :test #'equal))
+          (sprite-mcp-tools--poll-interval 0.01)
+          (default-directory default-directory)
+          (sprite-mcp-tools-directory nil)
+          (load-path load-path)
+          (running nil)
+          (calls nil))
+     (unwind-protect
+         (cl-letf (((symbol-function 'sprite-create)
+                    (lambda (unique-name &rest _)
+                      (let* ((idx (sprite--next-idx "work"))
+                             (full (sprite--format-full-name "work" idx unique-name)))
+                        (sprite--ensure-state-dir full)
+                        (push (list :create full) calls)
+                        (push full running)
+                        (let ((s (sprite--make :name full :idx idx :parent "work"
+                                               :unique-name unique-name :pid 111)))
+                          (sprite--registry-put s)
+                          s))))
+                   ((symbol-function 'sprite-stop)
+                    (lambda (name)
+                      (push (list :stop name) calls)
+                      (setq running (delete name running))))
+                   ((symbol-function 'sprite-restart)
+                    (lambda (name)
+                      (push (list :restart name) calls)
+                      (cl-pushnew name running :test #'equal)))
+                   ((symbol-function 'sprite--running-p)
+                    (lambda (name) (and (member name running) t)))
+                   ((symbol-function 'sprite-mcp-tools--call)
+                    (lambda (full form _timeout)
+                      (when (member full running)
+                        ;; Stand-in for the remote sprite: evaluate locally
+                        ;; (state is isolated by the outer let).
+                        (eval form t)))))
+           ,@body)
+       (delete-directory root t))))
+
+(defun sprite-mcp-tools-test/make-dir (full &rest files)
+  "Create the state dir for FULL containing FILES; return its path."
+  (let ((dir (sprite-state-directory :full-name full)))
+    (make-directory dir t)
+    (dolist (f files) (write-region "" nil (expand-file-name f dir)))
+    dir))
+
+;;;; Registration
+
+(ert-deftest sprite-mcp-tools/registers-all-tools-on-sprite-service ()
+  (let ((svc (mcpkit-get-service 'sprite)))
+    (should svc)
+    (dolist (n '("sprite_start" "sprite_eval" "sprite_restart"
+                 "sprite_stop" "sprite_list" "sprite_cleanup_stale"))
+      (should (gethash n (mcpkit-service-tools svc))))))
+
+(ert-deftest sprite-mcp-tools/descriptions-warn-about-isolation-and-decommission ()
+  (let ((tools (mcpkit-service-tools (mcpkit-get-service 'sprite))))
+    (should (string-match-p "NOT isolated"
+                            (mcpkit-tool-description (gethash "sprite_eval" tools))))
+    (should (string-match-p "never decommissions"
+                            (mcpkit-tool-description (gethash "sprite_stop" tools))))))
+
+;;;; sprite_start
+
+(ert-deftest sprite-mcp-tools/start-returns-name-pid-directory ()
+  (sprite-mcp-tools-test/with-env
+    (let* ((dir (make-temp-file "wt-" t))
+           (res (sprite-mcp-tools--start (list :name "wt-foo" :directory dir))))
+      (unwind-protect
+          (progn
+            (should (eq t (plist-get res :ok)))
+            (should (equal "work.0.wt-foo" (plist-get res :name)))
+            (should (equal (file-name-as-directory dir) (plist-get res :directory)))
+            (should (member '(:create "work.0.wt-foo") calls)))
+        (delete-directory dir t)))))
+
+(ert-deftest sprite-mcp-tools/start-setup-form-sets-load-path ()
+  (let* ((dir (make-temp-file "wt-" t))
+         (lisp (expand-file-name "lisp" dir)))
+    (unwind-protect
+        (progn
+          (make-directory lisp)
+          (let ((load-path '("/x")) (default-directory "/") (sprite-mcp-tools-directory nil))
+            (eval (sprite-mcp-tools--setup-form dir) t)
+            (should (equal (file-name-as-directory dir) default-directory))
+            (should (equal (list (directory-file-name dir) lisp "/x") load-path))))
+      (delete-directory dir t))))
+
+(ert-deftest sprite-mcp-tools/start-setup-form-skips-missing-lisp-dir ()
+  (let ((dir (make-temp-file "wt-" t)))
+    (unwind-protect
+        (let ((load-path '("/x")) (default-directory "/") (sprite-mcp-tools-directory nil))
+          (eval (sprite-mcp-tools--setup-form dir) t)
+          (should (equal (list (directory-file-name dir) "/x") load-path)))
+      (delete-directory dir t))))
+
+(ert-deftest sprite-mcp-tools/start-rejects-bad-input-without-signalling ()
+  (sprite-mcp-tools-test/with-env
+    (should-not (plist-get (sprite-mcp-tools--start nil) :ok))
+    (should-not (plist-get (sprite-mcp-tools--start '(:name "a.b")) :ok))
+    (let ((res (sprite-mcp-tools--start '(:name "ok" :directory "/no/such/dir/x"))))
+      (should-not (plist-get res :ok))
+      (should (string-match-p "does not exist" (plist-get res :error))))
+    (should-not calls)))
+
+(ert-deftest sprite-mcp-tools/start-refuses-own-instance-name ()
+  (sprite-mcp-tools-test/with-env
+    (let ((res (sprite-mcp-tools--start '(:name "work"))))
+      (should-not (plist-get res :ok))
+      (should (string-match-p "Refusing" (plist-get res :error)))
+      (should-not calls))))
+
+;;;; sprite_eval
+
+(ert-deftest sprite-mcp-tools/eval-returns-printed-result-by-full-and-short-name ()
+  (sprite-mcp-tools-test/with-env
+    (sprite-mcp-tools--start '(:name "wt-foo"))
+    (let ((a (sprite-mcp-tools--eval '(:name "work.0.wt-foo" :expression "(+ 1 2)")))
+          (b (sprite-mcp-tools--eval '(:name "wt-foo" :expression "(+ 1 2) (* 2 3)"))))
+      (should (equal "3" (plist-get a :result)))
+      (should (equal "6" (plist-get b :result)))
+      (should (equal "work.0.wt-foo" (plist-get b :name))))))
+
+(ert-deftest sprite-mcp-tools/eval-nil-result-is-success ()
+  (sprite-mcp-tools-test/with-env
+    (sprite-mcp-tools--start '(:name "wt-foo"))
+    (let ((res (sprite-mcp-tools--eval '(:name "wt-foo" :expression "nil"))))
+      (should (eq t (plist-get res :ok)))
+      (should (equal "nil" (plist-get res :result))))))
+
+(ert-deftest sprite-mcp-tools/eval-remote-error-is-structured ()
+  (sprite-mcp-tools-test/with-env
+    (sprite-mcp-tools--start '(:name "wt-foo"))
+    (let ((res (sprite-mcp-tools--eval '(:name "wt-foo" :expression "(error \"boom\")"))))
+      (should-not (plist-get res :ok))
+      (should (equal "boom" (plist-get res :error))))))
+
+(ert-deftest sprite-mcp-tools/eval-unreadable-expression-is-structured ()
+  (sprite-mcp-tools-test/with-env
+    (sprite-mcp-tools--start '(:name "wt-foo"))
+    (let ((res (sprite-mcp-tools--eval '(:name "wt-foo" :expression "(unbalanced"))))
+      (should-not (plist-get res :ok))
+      (should (string-match-p "Cannot read" (plist-get res :error))))))
+
+(ert-deftest sprite-mcp-tools/eval-unknown-or-dead-sprite-is-structured ()
+  (sprite-mcp-tools-test/with-env
+    (should-not (plist-get (sprite-mcp-tools--eval '(:name "nope" :expression "1")) :ok))
+    (sprite-mcp-tools--start '(:name "wt-foo"))
+    (setq running nil)
+    (let ((res (sprite-mcp-tools--eval '(:name "wt-foo" :expression "1"))))
+      (should-not (plist-get res :ok))
+      (should (string-match-p "No response" (plist-get res :error))))))
+
+(ert-deftest sprite-mcp-tools/eval-refuses-current-instance-and-parent ()
+  (sprite-mcp-tools-test/with-env
+    (let ((sprite-instance-id "work.6.wt-self")
+          (evaluated nil))
+      (cl-letf (((symbol-function 'sprite-mcp-tools--call)
+                 (lambda (&rest _) (setq evaluated t) '(:ok "1"))))
+        (dolist (n '("work.6.wt-self" "work"))
+          (let ((res (sprite-mcp-tools--eval (list :name n :expression "1"))))
+            (should-not (plist-get res :ok))
+            (should (string-match-p "Refusing" (plist-get res :error)))))
+        (should-not evaluated)))))
+
+;;;; sprite_stop
+
+(ert-deftest sprite-mcp-tools/stop-stops-never-decommissions ()
+  (sprite-mcp-tools-test/with-env
+    (sprite-mcp-tools--start '(:name "wt-foo"))
+    (let ((decommissioned nil))
+      (cl-letf (((symbol-function 'sprite-decommission)
+                 (lambda (&rest _) (setq decommissioned t))))
+        (let ((res (sprite-mcp-tools--stop '(:name "wt-foo"))))
+          (should (eq t (plist-get res :ok)))
+          (should-not (plist-get res :running))
+          (should (member '(:stop "work.0.wt-foo") calls))
+          (should-not decommissioned)
+          (should-not (sprite--decommissioned-p "work.0.wt-foo")))))))
+
+(ert-deftest sprite-mcp-tools/stop-reports-still-running ()
+  (sprite-mcp-tools-test/with-env
+    (sprite-mcp-tools--start '(:name "wt-foo"))
+    (cl-letf (((symbol-function 'sprite-stop) (lambda (_) nil))
+              ((symbol-function 'sprite-mcp-tools--wait-stopped) (lambda (&rest _) nil)))
+      (let ((res (sprite-mcp-tools--stop '(:name "wt-foo"))))
+        (should-not (plist-get res :ok))
+        (should (eq t (plist-get res :running)))))))
+
+(ert-deftest sprite-mcp-tools/stop-refuses-current-instance ()
+  (sprite-mcp-tools-test/with-env
+    (let ((res (sprite-mcp-tools--stop '(:name "work"))))
+      (should-not (plist-get res :ok))
+      (should-not calls))))
+
+;;;; sprite_restart
+
+(ert-deftest sprite-mcp-tools/restart-reapplies-remembered-directory ()
+  (sprite-mcp-tools-test/with-env
+    (let ((dir (make-temp-file "wt-" t))
+          (applied nil))
+      (unwind-protect
+          (progn
+            (sprite-mcp-tools--start (list :name "wt-foo" :directory dir))
+            (cl-letf (((symbol-function 'sprite-mcp-tools--apply-directory)
+                       (lambda (full d _t) (push (cons full d) applied) nil)))
+              (let ((res (sprite-mcp-tools--restart '(:name "wt-foo"))))
+                (should (eq t (plist-get res :ok)))
+                (should (equal (list (cons "work.0.wt-foo" (expand-file-name dir)))
+                               applied))
+                (should (member '(:stop "work.0.wt-foo") calls))
+                (should (member '(:restart "work.0.wt-foo") calls)))))
+        (delete-directory dir t)))))
+
+(ert-deftest sprite-mcp-tools/restart-refuses-decommissioned ()
+  (sprite-mcp-tools-test/with-env
+    (sprite-mcp-tools--start '(:name "wt-foo"))
+    (sprite--write-decommissioned-file "work.0.wt-foo")
+    (let ((res (sprite-mcp-tools--restart '(:name "wt-foo"))))
+      (should-not (plist-get res :ok))
+      (should-not (member '(:restart "work.0.wt-foo") calls)))))
+
+;;;; sprite_list
+
+(ert-deftest sprite-mcp-tools/list-reports-running-sprites ()
+  (sprite-mcp-tools-test/with-env
+    (sprite-mcp-tools--start '(:name "wt-a"))
+    (sprite-mcp-tools--start '(:name "wt-b"))
+    (sprite-mcp-tools--stop '(:name "wt-b"))
+    (let* ((res (sprite-mcp-tools--list nil))
+           (sprites (append (plist-get res :sprites) nil)))
+      (should (eq t (plist-get res :ok)))
+      (should (= 1 (plist-get res :count)))
+      (should (equal "work.0.wt-a" (plist-get (car sprites) :name)))
+      (should (equal "wt-a" (plist-get (car sprites) :unique_name))))))
+
+(ert-deftest sprite-mcp-tools/list-tolerates-unresponsive-sprite ()
+  (sprite-mcp-tools-test/with-env
+    (sprite-mcp-tools--start '(:name "wt-a"))
+    (cl-letf (((symbol-function 'sprite-mcp-tools--call) (lambda (&rest _) nil)))
+      (let* ((res (sprite-mcp-tools--list nil))
+             (e (aref (plist-get res :sprites) 0)))
+        (should (eq t (plist-get res :ok)))
+        (should (equal "work.0.wt-a" (plist-get e :name)))
+        (should (equal 111 (plist-get e :pid)))
+        (should-not (plist-get e :directory))))))
+
+;;;; sprite_cleanup_stale
+
+(ert-deftest sprite-mcp-tools/cleanup-defaults-to-dry-run ()
+  (sprite-mcp-tools-test/with-env
+    (let ((d (sprite-mcp-tools-test/make-dir "work.3.old" "DECOMMISSIONED")))
+      (let ((res (sprite-mcp-tools--cleanup-stale nil)))
+        (should (eq t (plist-get res :dry_run)))
+        (should (= 1 (length (plist-get res :found))))
+        (should (= 0 (length (plist-get res :removed))))
+        (should (file-directory-p d))))))
+
+(ert-deftest sprite-mcp-tools/cleanup-removes-marker-only-and-empty-dirs ()
+  (sprite-mcp-tools-test/with-env
+    (let ((marker (sprite-mcp-tools-test/make-dir "work.3.old" "DECOMMISSIONED"))
+          (empty (sprite-mcp-tools-test/make-dir "work.4.empty"))
+          (real (sprite-mcp-tools-test/make-dir "work.5.real" "DECOMMISSIONED" "other"))
+          (live (sprite-mcp-tools-test/make-dir "work.6.live" "DECOMMISSIONED")))
+      (push "work.6.live" running)
+      (dolist (false-val '(:json-false nil))
+        (when (eq false-val nil)
+          ;; recreate for the second encoding of false
+          (sprite-mcp-tools-test/make-dir "work.3.old" "DECOMMISSIONED")
+          (sprite-mcp-tools-test/make-dir "work.4.empty"))
+        (let ((res (sprite-mcp-tools--cleanup-stale (list :dry_run false-val))))
+          (should (eq :json-false (plist-get res :dry_run)))
+          (should (= 2 (length (plist-get res :removed))))
+          (should-not (file-exists-p marker))
+          (should-not (file-exists-p empty))
+          (should (file-directory-p real))
+          (should (file-directory-p live)))))))
+
+(ert-deftest sprite-mcp-tools/cleanup-leaves-protected-instance-dir ()
+  (sprite-mcp-tools-test/with-env
+    (let ((sprite-instance-id "work.6.wt-self"))
+      (let ((d (sprite-state-directory :full-name "work.6.wt-self")))
+        (make-directory d t)
+        (sprite-mcp-tools--cleanup-stale '(:dry_run :json-false))
+        (should (file-directory-p d))))))
+
+;;;; Integration (real daemons)
+
+(ert-deftest sprite-mcp-tools/integration-create-eval-restart-stop ()
+  "Real create/eval/restart/stop cycle; skipped unless SPRITE_MCP_INTEGRATION=1.
+Run it only in an isolated batch Emacs with its own HOME and
+`user-emacs-directory' and a private `sprite-instance-id', because it
+spawns real daemons."
+  (skip-unless (equal "1" (getenv "SPRITE_MCP_INTEGRATION")))
+  (let* ((dir (make-temp-file "sprite-mcp-it-" t))
+         (_ (make-directory (expand-file-name "lisp" dir)))
+         (start (sprite-mcp-tools--start (list :name "it" :directory dir :timeout 60)))
+         (full (plist-get start :name)))
+    (unwind-protect
+        (progn
+          (should (eq t (plist-get start :ok)))
+          (should (equal "3" (plist-get (sprite-mcp-tools--eval
+                                         (list :name "it" :expression "(+ 1 2)"))
+                                        :result)))
+          (should (equal (file-name-as-directory dir)
+                         (read (plist-get (sprite-mcp-tools--eval
+                                           (list :name full :expression "default-directory"))
+                                          :result))))
+          (should (= 1 (plist-get (sprite-mcp-tools--list nil) :count)))
+          (sprite-mcp-tools--eval (list :name full :expression "(setq sprite-it-var 1)"))
+          (should (eq t (plist-get (sprite-mcp-tools--restart (list :name "it" :timeout 60))
+                                   :ok)))
+          (should (equal "(unbound)"
+                         (plist-get (sprite-mcp-tools--eval
+                                     (list :name full
+                                           :expression "(if (boundp 'sprite-it-var) 'bound '(unbound))"))
+                                    :result)))
+          (should (equal (file-name-as-directory dir)
+                         (read (plist-get (sprite-mcp-tools--eval
+                                           (list :name full :expression "default-directory"))
+                                          :result)))))
+      (sprite-mcp-tools--stop (list :name full))
+      (should-not (sprite--running-p full))
+      (delete-directory dir t))))
+
+(provide 'test-sprite-mcp-tools)
+;;; test-sprite-mcp-tools.el ends here

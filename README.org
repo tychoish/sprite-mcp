@@ -19,6 +19,7 @@
   - [[#use-package-with-vc][use-package with VC]]
   - [[#manual-installation][Manual Installation]]
 - [[#usage][Usage]]
+- [[#sprite-mcp-tools][Plain sprite tools]]
 - [[#api-reference][API Reference]]
 - [[#related-packages][Related Packages]]
 - [[#license][License]]
@@ -83,6 +84,37 @@ Tear it down explicitly when done, or let the idle reaper reap it once it goes q
 #+BEGIN_SRC emacs-lisp
 (sprite-mcp-kill my/demo-sprite)
 #+END_SRC
+
+* Plain sprite tools (sprite-mcp-tools)
+:PROPERTIES:
+:CUSTOM_ID: sprite-mcp-tools
+:END:
+
+=sprite-mcp-tools.el= is separate from =sprite-mcp-spawn=: it registers MCP tools on an mcpkit service named =sprite= for driving *plain* sprites -- ephemeral, isolated Emacs daemons, typically one per git worktree, for running ERT or byte-compile checks without touching the user's main daemon (evaluating in the main daemon is /not/ isolated). No worktree, branch, or proxy route is created.
+
+#+BEGIN_SRC emacs-lisp
+(require 'sprite-mcp-tools) ;; registers the `sprite' service; started by mcpkit autostart
+#+END_SRC
+
+| Tool                   | Arguments                                   | Description                                                                                       |
+|------------------------+---------------------------------------------+---------------------------------------------------------------------------------------------------|
+| =sprite_start=         | =name=, =directory=?, =timeout=?            | Start a sprite; with =directory= set =default-directory= and prepend it (and =lisp/=) to =load-path=. |
+| =sprite_eval=          | =name=, =expression=, =timeout=?            | Evaluate Lisp in a sprite (full or short name); returns the printed result or the error text.    |
+| =sprite_restart=       | =name=, =directory=?, =timeout=?            | Restart under the same name and re-apply the directory setup (restarted daemons are blank).      |
+| =sprite_stop=          | =name=                                      | Stop the sprite and confirm it is no longer running.                                             |
+| =sprite_list=          | none                                        | Running sprites: name, unique name, pid, uptime, directory.                                      |
+| =sprite_cleanup_stale= | =dry_run=? (default true)                   | Report/delete state dirs that are empty or hold only a =DECOMMISSIONED= marker (not running).    |
+
+Every tool returns a plist: =(:ok t ...)= on success, =(:ok nil :error MSG)= on failure; handlers never prompt or signal. The tools refuse to stop or evaluate in the current Emacs instance or its parent.
+
+** Stop, don't decommission
+The tools tear sprites down with =sprite-stop= only, never =sprite-decommission=. Decommissioning writes a permanent =DECOMMISSIONED= marker into the sprite's state directory; sprite indexes are reused after a sprite is gone, so a leftover marker later makes =sprite-create= refuse the reused name. Use =sprite_cleanup_stale= to find and remove such leftovers.
+
+** How eval returns values
+=sprite_eval= wraps the form in a =condition-case= that returns =(:ok PRINTED)= or =(:error MSG)=, so a =nil= result, a remote error and an unreachable sprite are distinguishable (=with-sprite= and =sprite-direct-eval-blocking= return plain =nil= for all of them). Evaluation runs with =default-directory= bound to the sprite's configured directory, because =emacsclient= rebinds it to the client's cwd on every call.
+
+** Tests
+=test/test-sprite-mcp-tools.el= mocks the sprite lifecycle. One integration test (real create/eval/restart/stop) runs only with =SPRITE_MCP_INTEGRATION=1=; run it in an isolated batch Emacs (own =HOME= and =sprite-instance-id=) since it spawns real daemons.
 
 * API Reference
 :PROPERTIES:
