@@ -161,16 +161,21 @@ This is the single function the unit tests mock."
 FORM runs with `default-directory' bound to the sprite's configured
 directory, if any.  Returns (:ok PRINTED) on success or (:error MESSAGE)
 otherwise."
-  (let* ((wrapped `(condition-case err
-                       (list :ok (prin1-to-string
-                  (let ((default-directory
-                         (or (bound-and-true-p sprite-mcp-tools-directory)
-                             default-directory)))
-                    ,form)))
-                     (error (list :error (error-message-string err)))))
+  ;; ERT on Emacs 29 uses the debugger to capture failures.  Permit that
+  ;; inside its tests while keeping ordinary remote errors non-interactive.
+  (let* ((debug-on-error nil)
+         (debug-on-signal nil)
+         (wrapped `(let ((debug-on-error nil) (debug-on-signal nil))
+                     (condition-case err
+                         (list :ok (prin1-to-string
+                                    (let ((default-directory
+                                           (or (bound-and-true-p sprite-mcp-tools-directory)
+                                               default-directory)))
+                                      ,form)))
+                       ((debug error) (list :error (error-message-string err))))))
          (res (condition-case err
                   (sprite-mcp-tools--call full-name wrapped timeout)
-                (error (list :error (error-message-string err))))))
+                ((debug error) (list :error (error-message-string err))))))
     (cond
      ((and (consp res) (memq (car res) '(:ok :error))) res)
      (t (list :error (format "No response from %s (not running, or timed out after %ss)"

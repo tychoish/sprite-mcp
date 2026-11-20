@@ -34,7 +34,9 @@
   (let ((original-default (default-value 'default-directory)))
     (unwind-protect
         (with-temp-buffer
-          (let ((buffer (current-buffer)))
+          (let ((buffer (current-buffer))
+                (debug-on-error nil)
+                (debug-on-signal nil))
             (cl-letf (((symbol-function 'buffer-list) (lambda (&rest _) (list buffer))))
               (eval form t))))
       (set-default 'default-directory original-default))))
@@ -467,6 +469,19 @@ Binds `services' (alist of full name to MCP port started), `running' (list of ru
 
 ;;;; sprite_run_tests
 
+(ert-deftest sprite-mcp-tools/remote-eval-errors-with-debugging-enabled ()
+  (let ((debug-on-error t)
+        (debugger (lambda (&rest _) (error "Unexpected debugger invocation"))))
+    (cl-letf (((symbol-function 'sprite-mcp-tools--call)
+               (lambda (_name form _timeout)
+                 (let ((debug-on-error t)) (eval form t)))))
+      (should (equal '(:error "remote failure")
+                     (sprite-mcp-tools--remote-eval "test" '(error "remote failure") 1))))
+    (cl-letf (((symbol-function 'sprite-mcp-tools--call)
+               (lambda (&rest _) (error "transport failure"))))
+      (should (equal '(:error "transport failure")
+                     (sprite-mcp-tools--remote-eval "test" t 1))))))
+
 (defmacro sprite-mcp-tools-test/with-test-file (var &rest body)
   "Bind VAR to a temp ERT file with one passing, one failing, one skipped test."
   (declare (indent 1))
@@ -515,8 +530,9 @@ Binds `services' (alist of full name to MCP port started), `running' (list of ru
 (ert-deftest sprite-mcp-tools/run-tests-load-error-and-bad-input-are-structured ()
   (sprite-mcp-tools-test/with-env
     (sprite-mcp-tools--start (list :name "re"))
-    (should-not (plist-get (sprite-mcp-tools--run-tests
-                            (list :name "re" :main_features ["no-such-feature-xyz"])) :ok))
+    (let ((debug-on-error t))
+      (should-not (plist-get (sprite-mcp-tools--run-tests
+                              (list :name "re" :main_features ["no-such-feature-xyz"])) :ok)))
     (should-not (plist-get (sprite-mcp-tools--run-tests
                             (list :name "re" :test_files ["/nonexistent.el"])) :ok))
     (should-not (plist-get (sprite-mcp-tools--run-tests (list :name "unknown")) :ok))
