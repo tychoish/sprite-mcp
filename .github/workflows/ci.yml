@@ -34,4 +34,4 @@ jobs:
         with:
           runner: ert
           dependencies: "sprite mcpkit"
-          test-files: "test/test-sprite-mcp.el"
+          test-files: "test/test-sprite-mcp.el test/test-sprite-mcp-tools.el"
